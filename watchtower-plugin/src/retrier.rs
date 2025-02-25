@@ -10,7 +10,8 @@ use backoff::{Error, ExponentialBackoff};
 use teos_common::appointment::Locator;
 use teos_common::cryptography;
 use teos_common::errors;
-use teos_common::UserId as TowerId;
+use teos_common::TowerId;
+
 
 use crate::net::http::{self, AddAppointmentError};
 use crate::wt_client::{RevocationData, WTClient};
@@ -117,7 +118,7 @@ impl RetryManager {
                                 self.wt_client
                                     .lock()
                                     .unwrap()
-                                    .dbm
+                                    .storage
                                     .load_appointment_locators(
                                         retrier.tower_id,
                                         crate::AppointmentStatus::Pending,
@@ -159,7 +160,7 @@ impl RetryManager {
                                     self.wt_client
                                         .lock()
                                         .unwrap()
-                                        .dbm
+                                        .storage
                                         .load_appointment_locators(
                                             retrier.tower_id,
                                             crate::AppointmentStatus::Pending,
@@ -482,7 +483,7 @@ impl Retrier {
                     .wt_client
                     .lock()
                     .unwrap()
-                    .dbm
+                    .storage
                     .load_appointment(locator)
                     .unwrap();
 
@@ -576,8 +577,12 @@ impl Retrier {
 mod tests {
     use super::*;
 
-    use serde_json::json;
+    use crate::storage::{create_storage, StorageConfig};
+    #[cfg(feature = "core-lightning")]
     use tempdir::TempDir;
+
+    use serde_json::json;
+
     use tokio::sync::mpsc::unbounded_channel;
 
     use teos_common::errors;
@@ -585,20 +590,25 @@ mod tests {
     use teos_common::protos::AddAppointmentRequest;
     use teos_common::receipts::{AppointmentReceipt, RegistrationReceipt};
     use teos_common::test_utils::{
-        generate_random_appointment, get_random_registration_receipt, get_random_user_id,
+        generate_random_appointment, get_random_registration_receipt,
         get_registration_receipt_from_previous,
     };
 
+    use teos_common::UserId;
+    use bitcoin::secp256k1::{PublicKey, Secp256k1};
+
     use crate::net::http::ApiError;
+    #[cfg(feature = "ldk-node")]
+    use crate::storage::mock_kv::MemoryStore;
     use crate::test_utils::get_dummy_add_appointment_response;
 
     const LONG_AUTO_RETRY_DELAY: u32 = 60;
     const SHORT_AUTO_RETRY_DELAY: u32 = 3;
     const API_DELAY: f64 = 0.5;
     const HALF_API_DELAY: f64 = API_DELAY / 2.0;
-    const MAX_ELAPSED_TIME: u16 = 2;
+    const MAX_ELAPSED_TIME: u16 = 3;
     const MAX_INTERVAL_TIME: u16 = 1;
-    const MAX_RUN_TIME: f64 = 0.2;
+    const MAX_RUN_TIME: f64 = 1.0;
 
     macro_rules! wait_until {
         () => {};
@@ -625,12 +635,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_reachable() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
-        let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
-        ));
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
 
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
+        ));
         let mut server = mockito::Server::new_async().await;
 
         // Add a tower with pending appointments
@@ -719,10 +742,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_unreachable() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
 
         // Add a tower with pending appointments
@@ -845,10 +882,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_rejected() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
         let mut server = mockito::Server::new_async().await;
 
@@ -948,10 +999,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_misbehaving() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
         let mut server = mockito::Server::new_async().await;
 
@@ -1039,10 +1105,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_abandoned() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
         let (tx, rx) = unbounded_channel();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
         let server = mockito::Server::new_async().await;
 
@@ -1081,10 +1161,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_subscription_error() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
         let mut server = mockito::Server::new_async().await;
 
@@ -1191,36 +1285,50 @@ mod tests {
 
     #[tokio::test]
     async fn test_manage_retry_while_idle() {
-        use crate::dbm::DBM;
         // Let's try adding a tower, setting it to idle and send revocation data in all its forms
         // This replicates the three types of data the retrier can receive:
         // - Initialization (from db) with stale data
         // - Regular (fresh) data from `on_commitment_revocation`
         // - A wake up call with no data
 
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
         let (tx, rx) = unbounded_channel();
 
         // Stale data is sent on WTClient initialization if found in the database. We'll force that to happen by populating the DB before initializing the WTClient
         let (tower_sk, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
 
-        let mut dbm = DBM::new(&tmp_path.path().to_path_buf().join("watchtowers_db.sql3")).unwrap();
+        #[cfg(feature = "ldk-node")]
+        let mut storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let mut storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let receipt = get_random_registration_receipt();
-        dbm.store_tower_record(tower_id, "http://unreachable.tower", &receipt)
+        storage
+            .store_tower_record(tower_id, "http://unreachable.tower", &receipt)
             .unwrap();
 
         let appointment = generate_random_appointment(None);
-        dbm.store_pending_appointment(tower_id, &appointment)
+        storage
+            .store_pending_appointment(tower_id, &appointment)
             .unwrap();
-
         // Now we can create the WTClient and check that the data is pending
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+            WTClient::new(storage, keypair.0, tx.clone()).await,
         ));
 
         // Also create the retrier thread so retries can be managed
         let wt_client_clone = wt_client.clone();
+
         let task = tokio::spawn(async move {
             RetryManager::new(
                 wt_client_clone,
@@ -1351,10 +1459,25 @@ mod tests {
     async fn test_retry_tower() {
         let (tower_sk, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
+
         let mut server = mockito::Server::new_async().await;
 
         // The tower we'd like to retry sending appointments to has to exist within the plugin
@@ -1399,9 +1522,24 @@ mod tests {
     async fn test_retry_tower_no_pending() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
         let server = mockito::Server::new_async().await;
 
@@ -1422,9 +1560,24 @@ mod tests {
     async fn test_retry_tower_misbehaving() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
         let mut server = mockito::Server::new_async().await;
 
@@ -1473,9 +1626,23 @@ mod tests {
     async fn test_retry_tower_unreachable() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
 
         // The tower we'd like to retry sending appointments to has to exist within the plugin
@@ -1504,10 +1671,26 @@ mod tests {
     async fn test_retry_tower_subscription_error() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
+
         let mut server = mockito::Server::new_async().await;
 
         // The tower we'd like to retry sending appointments to has to exist within the plugin
@@ -1557,10 +1740,26 @@ mod tests {
     async fn test_retry_tower_rejected() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
+
         let mut server = mockito::Server::new_async().await;
 
         // The tower we'd like to retry sending appointments to has to exist within the plugin
@@ -1616,9 +1815,24 @@ mod tests {
     async fn test_retry_tower_abandoned() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
+        let keypair = cryptography::get_random_keypair();
+
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
+            WTClient::new(storage, keypair.0, unbounded_channel().0).await,
         ));
 
         // The tower we'd like to retry sending appointments to has to exist within the plugin

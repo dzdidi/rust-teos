@@ -3855,10 +3855,13 @@ name = "watchtower-plugin"
 version = "0.2.0"
 dependencies = [
  "backoff",
+ "bincode",
  "bitcoin",
+ "chacha20poly1305 0.10.1",
  "cln-plugin",
  "hex",
  "home",
+ "lightning",
  "log",
  "mockito",
  "reqwest",

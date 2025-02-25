@@ -10,7 +10,7 @@ use teos_common::TowerId;
 
 pub mod constants;
 pub mod convert;
-pub mod dbm;
+pub mod storage;
 pub mod net;
 pub mod retrier;
 mod ser;
