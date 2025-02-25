@@ -29,6 +29,8 @@ use watchtower_plugin::retrier::RetryManager;
 use watchtower_plugin::wt_client::{RevocationData, WTClient};
 use watchtower_plugin::{constants, TowerStatus};
 
+use watchtower_plugin::storage::{create_storage, StorageConfig};
+
 const DEV_WT_MAX_RETRY_INTERVAL_CONFIG: ConfigOption<DefaultInteger> =
     ConfigOption::new_i64_with_default(
         constants::DEV_WT_MAX_RETRY_INTERVAL,
@@ -623,10 +625,19 @@ async fn main() -> Result<(), Error> {
         return Ok(());
     };
 
+    let storage = {
+        let db_path = data_dir.as_path().join("watchtower.db");
+        create_storage(StorageConfig::SQL { db_path }).unwrap()
+    };
+
+    // HACK
+    let (sk, _pk) = cryptography::get_random_keypair();
+
     let (tx, rx) = unbounded_channel();
     let wt_client = Arc::new(Mutex::new(
         WTClient::with_proxy(
-            data_dir,
+            storage,
+            sk,
             tx,
             midstate.configuration().proxy.map(|proxy| {
                 // We don't need to inform `always-use-proxy` needing `proxy` to work. This is done by CLN already when needed.

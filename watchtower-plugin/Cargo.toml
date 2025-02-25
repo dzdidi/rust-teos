@@ -9,6 +9,11 @@ edition = "2021"
 name = "watchtower-client"
 path = "src/main.rs"
 
+[features]
+default = ["core-lightning"]
+core-lightning = []
+ldk-node = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -23,6 +28,11 @@ serde = "1.0.130"
 serde_json = { version = "1.0", features = [ "preserve_order" ] }
 tonic = { version = "0.11", features = [ "tls", "transport" ] }
 tokio = { version = "1.5", features = [ "rt-multi-thread", "fs" ] }
+
+# only needed for ldk node
+bincode = "1.3.3"
+lightning = "0.1.0"
+chacha20poly1305 = "0.10.1"
 
 # Bitcoin and Lightning
 bitcoin = "0.32.0"

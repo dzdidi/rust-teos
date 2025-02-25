@@ -1,21 +1,19 @@
+use crate::storage::persister::{Persister, PersisterError};
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
-use std::path::PathBuf;
-use tokio::fs;
+
 use tokio::sync::mpsc::UnboundedSender;
 
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 use teos_common::appointment::{Appointment, Locator};
-use teos_common::cryptography;
-use teos_common::dbm::Error as DBError;
 use teos_common::receipts::{AppointmentReceipt, RegistrationReceipt};
 use teos_common::{TowerId, UserId};
 
-use crate::dbm::DBM;
-use crate::net::ProxyInfo;
 use crate::retrier::RetrierStatus;
 use crate::{MisbehaviorProof, SubscriptionError, TowerInfo, TowerStatus, TowerSummary};
+
+use crate::net::ProxyInfo;
 
 #[derive(Eq, PartialEq)]
 pub enum RevocationData {
@@ -57,10 +55,9 @@ impl std::fmt::Debug for RevocationData {
     }
 }
 
-/// Represents the watchtower client that is being used as the CoreLN plugin state.
 pub struct WTClient {
-    /// A [DBM] instance.
-    pub dbm: DBM,
+    /// A database manager instance implementing the DatabaseManager trait
+    pub storage: Box<dyn Persister>,
     /// A collection of towers the client is registered to.
     pub towers: HashMap<TowerId, TowerSummary>,
     /// Queue of unreachable towers.
@@ -77,38 +74,22 @@ pub struct WTClient {
 
 impl WTClient {
     pub async fn new(
-        data_dir: PathBuf,
+        storage: Box<dyn Persister>,
+        user_sk: SecretKey,
         unreachable_towers: UnboundedSender<(TowerId, RevocationData)>,
     ) -> Self {
-        Self::with_proxy(data_dir, unreachable_towers, None).await
+        Self::with_proxy(storage, user_sk, unreachable_towers, None).await
     }
 
     pub async fn with_proxy(
-        data_dir: PathBuf,
+        storage: Box<dyn Persister>,
+        user_sk: SecretKey,
         unreachable_towers: UnboundedSender<(TowerId, RevocationData)>,
         proxy: Option<ProxyInfo>,
     ) -> Self {
-        // Create data dir if it does not exist
-        fs::create_dir_all(&data_dir).await.unwrap_or_else(|e| {
-            log::error!("Cannot create data dir: {e:?}");
-            std::process::exit(1);
-        });
+        let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &user_sk));
 
-        let dbm = DBM::new(&data_dir.join("watchtowers_db.sql3")).unwrap();
-
-        let (user_sk, user_id) = if let Some(sk) = dbm.load_client_key() {
-            (
-                sk,
-                UserId(PublicKey::from_secret_key(&Secp256k1::new(), &sk)),
-            )
-        } else {
-            log::info!("Watchtower client keys not found. Creating a fresh set");
-            let (sk, pk) = cryptography::get_random_keypair();
-            dbm.store_client_key(&sk).unwrap();
-            (sk, UserId(pk))
-        };
-
-        let towers = dbm.load_towers();
+        let towers = storage.load_towers();
         for (tower_id, tower) in towers.iter() {
             if tower.status.is_temporary_unreachable() {
                 unreachable_towers
@@ -126,7 +107,7 @@ impl WTClient {
             towers,
             unreachable_towers,
             retriers: HashMap::new(),
-            dbm,
+            storage,
             user_sk,
             user_id,
             proxy,
@@ -146,14 +127,14 @@ impl WTClient {
             if receipt.subscription_expiry() <= tower.subscription_expiry {
                 return Err(SubscriptionError::Expiry);
             } else {
-                let tower_info = self.dbm.load_tower_record(tower_id).unwrap();
+                let tower_info = self.storage.load_tower_record(tower_id).unwrap();
                 if receipt.available_slots() <= tower_info.available_slots {
                     return Err(SubscriptionError::Slots);
                 }
             }
         }
 
-        self.dbm
+        self.storage
             .store_tower_record(tower_id, tower_net_addr, receipt)
             .unwrap();
 
@@ -181,12 +162,13 @@ impl WTClient {
 
     /// Gets the latest registration receipt of a given tower.
     pub fn get_registration_receipt(&self, tower_id: TowerId) -> Option<RegistrationReceipt> {
-        self.dbm.load_registration_receipt(tower_id, self.user_id)
+        self.storage
+            .load_registration_receipt(tower_id, self.user_id)
     }
 
     /// Loads a tower record from the database.
     pub fn load_tower_info(&self, tower_id: TowerId) -> Option<TowerInfo> {
-        self.dbm.load_tower_record(tower_id)
+        self.storage.load_tower_record(tower_id)
     }
 
     /// Gets the given tower status (identified by tower_id), if found.
@@ -224,7 +206,7 @@ impl WTClient {
             // DISCUSS: It may be nice to independently compute the slots and compare
             tower.available_slots = available_slots;
 
-            self.dbm
+            self.storage
                 .store_appointment_receipt(tower_id, locator, available_slots, receipt)
                 .unwrap();
         } else {
@@ -238,7 +220,7 @@ impl WTClient {
         tower_id: TowerId,
         locator: Locator,
     ) -> Option<AppointmentReceipt> {
-        self.dbm.load_appointment_receipt(tower_id, locator)
+        self.storage.load_appointment_receipt(tower_id, locator)
     }
 
     /// Adds a pending appointment to the tower record.
@@ -246,7 +228,7 @@ impl WTClient {
         if let Some(tower) = self.towers.get_mut(&tower_id) {
             tower.pending_appointments.insert(appointment.locator);
 
-            self.dbm
+            self.storage
                 .store_pending_appointment(tower_id, appointment)
                 .unwrap();
         } else {
@@ -259,7 +241,7 @@ impl WTClient {
         if let Some(tower) = self.towers.get_mut(&tower_id) {
             tower.pending_appointments.remove(&locator);
 
-            self.dbm
+            self.storage
                 .delete_pending_appointment(tower_id, locator)
                 .unwrap();
         } else {
@@ -272,7 +254,7 @@ impl WTClient {
         if let Some(tower) = self.towers.get_mut(&tower_id) {
             tower.invalid_appointments.insert(appointment.locator);
 
-            self.dbm
+            self.storage
                 .store_invalid_appointment(tower_id, appointment)
                 .unwrap();
         } else {
@@ -283,7 +265,9 @@ impl WTClient {
     /// Flags a given tower as misbehaving, storing the misbehaving proof in the database.
     pub fn flag_misbehaving_tower(&mut self, tower_id: TowerId, proof: MisbehaviorProof) {
         if let Some(tower) = self.towers.get_mut(&tower_id) {
-            self.dbm.store_misbehaving_proof(tower_id, &proof).unwrap();
+            self.storage
+                .store_misbehaving_proof(tower_id, &proof)
+                .unwrap();
             tower.status = TowerStatus::Misbehaving;
         } else {
             log::error!("Cannot flag tower. Unknown tower_id: {tower_id}");
@@ -293,12 +277,12 @@ impl WTClient {
     /// Removes a tower from the client (both memory and database).
     ///
     /// Any data associated to the tower will be deleted (i.e. links to appointments)
-    pub fn remove_tower(&mut self, tower_id: TowerId) -> Result<(), DBError> {
+    pub fn remove_tower(&mut self, tower_id: TowerId) -> Result<(), PersisterError> {
         if self.towers.contains_key(&tower_id) {
             self.towers.remove(&tower_id);
-            self.dbm.remove_tower_record(tower_id)
+            self.storage.remove_tower_record(tower_id)
         } else {
-            Err(DBError::NotFound)
+            Err(PersisterError::NotFound(format!("tower_id: {tower_id}")))
         }
     }
 }
@@ -307,7 +291,14 @@ impl WTClient {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ldk-node")]
+    use crate::storage::mock_kv::MemoryStore;
+
+    #[cfg(feature = "core-lightning")]
     use tempdir::TempDir;
+
+    use crate::storage::{create_storage, StorageConfig};
+    use teos_common::cryptography;
     use tokio::sync::mpsc::unbounded_channel;
 
     use teos_common::test_utils::{
@@ -318,9 +309,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_update_load_tower() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         // Adding a new tower will add a summary to towers and the full data to the
         let mut receipt = get_random_registration_receipt();
@@ -412,9 +416,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_tower_status() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         // If the tower is unknown, get_tower_status returns None
         let tower_id = get_random_user_id();
@@ -435,9 +452,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_tower_status() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         // If the tower is unknown nothing will happen
         let unknown_tower = get_random_user_id();
@@ -465,9 +495,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_appointment_receipt() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let (tower_sk, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
@@ -515,9 +558,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_pending_appointment() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let tower_id = get_random_user_id();
 
@@ -558,9 +614,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_pending_appointment() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let tower_id = get_random_user_id();
 
@@ -583,15 +652,28 @@ mod tests {
             .unwrap()
             .pending_appointments
             .contains(&appointment.locator));
-        // This bit is tested exhaustively in the DBM.
-        assert!(!wt_client.dbm.appointment_exists(appointment.locator));
+        // This bit is tested exhaustively in the Storage.
+        assert!(!wt_client.storage.appointment_exists(appointment.locator));
     }
 
     #[tokio::test]
     async fn test_add_invalid_appointment() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let tower_id = get_random_user_id();
 
@@ -628,9 +710,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_pending_appointment_to_invalid() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let tower_id = get_random_user_id();
 
@@ -659,22 +754,35 @@ mod tests {
             .invalid_appointments
             .contains(&appointment.locator));
         assert!(!wt_client
-            .dbm
+            .storage
             .load_appointment_locators(tower_id, crate::AppointmentStatus::Pending)
             .contains(&appointment.locator));
         assert!(wt_client
-            .dbm
+            .storage
             .load_appointment_locators(tower_id, crate::AppointmentStatus::Invalid)
             .contains(&appointment.locator));
-        assert!(wt_client.dbm.appointment_exists(appointment.locator));
+        assert!(wt_client.storage.appointment_exists(appointment.locator));
     }
 
     #[tokio::test]
     async fn test_move_pending_appointment_to_invalid_multiple_towers() {
         // Check that moving an appointment from pending to invalid can be done even if multiple towers have a reference to it
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let tower_id = get_random_user_id();
         let another_tower_id = get_random_user_id();
@@ -710,11 +818,11 @@ mod tests {
             .invalid_appointments
             .contains(&appointment.locator));
         assert!(!wt_client
-            .dbm
+            .storage
             .load_appointment_locators(tower_id, crate::AppointmentStatus::Pending)
             .contains(&appointment.locator));
         assert!(wt_client
-            .dbm
+            .storage
             .load_appointment_locators(tower_id, crate::AppointmentStatus::Invalid)
             .contains(&appointment.locator));
 
@@ -732,23 +840,36 @@ mod tests {
             .invalid_appointments
             .contains(&appointment.locator));
         assert!(wt_client
-            .dbm
+            .storage
             .load_appointment_locators(another_tower_id, crate::AppointmentStatus::Pending)
             .contains(&appointment.locator));
         assert!(!wt_client
-            .dbm
+            .storage
             .load_appointment_locators(another_tower_id, crate::AppointmentStatus::Invalid)
             .contains(&appointment.locator));
 
         // GENERAL
-        assert!(wt_client.dbm.appointment_exists(appointment.locator));
+        assert!(wt_client.storage.appointment_exists(appointment.locator));
     }
 
     #[tokio::test]
     async fn test_flag_misbehaving_tower() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let (tower_sk, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
@@ -781,9 +902,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_tower() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let receipt = get_random_registration_receipt();
         let (tower_sk, tower_pk) = cryptography::get_random_keypair();
@@ -826,13 +960,19 @@ mod tests {
             registration_receipt.available_slots(),
             &appointment_receipt,
         );
-        assert!(wt_client.dbm.appointment_receipt_exists(locator, tower_id));
+        // FIXME
+        assert!(wt_client
+            .storage
+            .appointment_receipt_exists(locator, tower_id));
 
         // Remove and check both the tower and the appointment
         wt_client.remove_tower(tower_id).unwrap();
         assert!(wt_client.load_tower_info(tower_id).is_none());
         assert!(!wt_client.towers.contains_key(&tower_id));
-        assert!(!wt_client.dbm.appointment_receipt_exists(locator, tower_id));
+        // FIXME
+        assert!(!wt_client
+            .storage
+            .appointment_receipt_exists(locator, tower_id));
     }
 
     #[tokio::test]
@@ -840,9 +980,22 @@ mod tests {
         // Lets test removing a tower that has associated data shared with another tower.
         // For instance, having an appointment that was sent to two towers, and then deleting one of them
         // should only remove the link between the tower and the appointment, but not delete the data.
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
+
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
 
         let receipt = get_random_registration_receipt();
         let (tower1_sk, tower1_pk) = cryptography::get_random_keypair();
@@ -876,26 +1029,49 @@ mod tests {
         );
 
         // Check that the data exists in both towers
-        assert!(wt_client.dbm.appointment_receipt_exists(locator, tower1_id));
-        assert!(wt_client.dbm.appointment_receipt_exists(locator, tower2_id));
+        assert!(wt_client
+            .storage
+            .appointment_receipt_exists(locator, tower1_id));
+        assert!(wt_client
+            .storage
+            .appointment_receipt_exists(locator, tower2_id));
 
         // Remove tower1 and check that the appointment receipt can still be found for tower2
         wt_client.remove_tower(tower1_id).unwrap();
         assert!(wt_client.load_tower_info(tower1_id).is_none());
 
-        assert!(!wt_client.dbm.appointment_receipt_exists(locator, tower1_id));
-        assert!(wt_client.dbm.appointment_receipt_exists(locator, tower2_id));
+        assert!(!wt_client
+            .storage
+            .appointment_receipt_exists(locator, tower1_id));
+        assert!(wt_client
+            .storage
+            .appointment_receipt_exists(locator, tower2_id));
     }
 
     #[tokio::test]
     async fn test_remove_inexistent_tower() {
-        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
-        let mut wt_client =
-            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
+        let keypair = cryptography::get_random_keypair();
+        #[cfg(feature = "ldk-node")]
+        let storage = create_storage(StorageConfig::KV {
+            kv_store: MemoryStore::new().into_dyn_store(),
+            sk: vec![0; 32],
+        }).unwrap();
 
-        assert!(matches!(
-            wt_client.remove_tower(get_random_user_id()),
-            Err(DBError::NotFound)
-        ));
+        #[cfg(feature = "core-lightning")]
+        let storage = {
+            let user_id = UserId(PublicKey::from_secret_key(&Secp256k1::new(), &keypair.0));
+            let tmp_path = TempDir::new(&format!("watchtower_{}", user_id)).unwrap();
+            let db_path = tmp_path.path().join("watchtower.db");
+            create_storage(StorageConfig::SQL { db_path }).unwrap()
+        };
+
+        let mut wt_client = WTClient::new(storage, keypair.0, unbounded_channel().0).await;
+
+        let tower_id = get_random_user_id();
+        let err = wt_client.remove_tower(tower_id).unwrap_err();
+        assert_eq!(
+            err,
+            PersisterError::NotFound(format!("tower_id: {tower_id}"))
+        );
     }
 }
