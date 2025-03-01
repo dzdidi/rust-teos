@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
+#[allow(unused_imports)]
+use std::str::FromStr;
 
 use crate::responder::ConfirmationStatus;
 use crate::{errors, rpc_errors};

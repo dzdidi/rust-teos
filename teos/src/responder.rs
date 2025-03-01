@@ -3,10 +3,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use bitcoin::hashes::Hash;
 use bitcoin::{consensus, BlockHash};
 use bitcoin::{Transaction, Txid};
 use lightning::chain;
-use lightning::util::ser::Writeable;
 use lightning_block_sync::poll::ValidatedBlock;
 
 use teos_common::constants;
