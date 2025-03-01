@@ -25,7 +25,7 @@ use bitcoin::hash_types::BlockHash;
 use bitcoin::hash_types::Txid;
 use bitcoin::hashes::Hash;
 use bitcoin::merkle_tree::calculate_root;
-use bitcoin::pow::Work;
+use bitcoin::pow::{Target, Work};
 use bitcoin::Amount;
 use bitcoin::Network;
 use bitcoin::Witness;
@@ -189,9 +189,7 @@ impl Blockchain {
     }
 
     pub fn generate(&mut self, txs: Option<Vec<Transaction>>) -> Block {
-        // FIXME: replace this magic number with something meaningul
-        let bits = bitcoin::CompactTarget::from_consensus(553713663);
-
+        let bits = bitcoin::CompactTarget::from(bitcoin::Target::MAX);
         let prev_block = self.blocks.last().unwrap();
         let prev_blockhash = prev_block.block_hash();
         let time = prev_block.header.time + (self.blocks.len() + 1) as u32;
@@ -205,7 +203,7 @@ impl Blockchain {
             }
             None => vec![get_random_tx()],
         };
-        let hashes = txdata.iter().map(|obj| obj.compute_txid().to_raw_hash());
+        let hashes = txdata.iter().map(|tx| tx.compute_txid().to_raw_hash());
         let mut header = bitcoin::block::Header {
             version: bitcoin::block::Version::from_consensus(0),
             prev_blockhash,

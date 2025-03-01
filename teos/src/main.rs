@@ -258,10 +258,11 @@ async fn main() {
         tip.height
     );
 
-    // This is how chain poller names bitcoin networks.
+    // Map "bitcoin" to "main" for backward compatibility with old configs,
+    // since Network::from_core_arg expects "main" for mainnet
     let btc_network = match conf.btc_network.as_str() {
-        "main" => "bitcoin",
-        "test" => "testnet",
+        "bitcoin" => "main",
+        "testnet" => "test",
         any => any,
     };
 
