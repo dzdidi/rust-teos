@@ -5,6 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use lightning::chain::chainmonitor::Persist;
+use lightning::sign::InMemorySigner;
+use lightning::chain::transaction::OutPoint;
+use lightning::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate};
+use lightning::chain::ChannelMonitorUpdateStatus;
+
 use teos_common::appointment::{Appointment, Locator};
 use teos_common::net::NetAddr;
 use teos_common::receipts::AppointmentReceipt;
@@ -22,6 +28,7 @@ pub mod retrier;
 mod ser;
 pub mod storage;
 pub mod wt_client;
+pub mod wt_connector;
 
 #[cfg(test)]
 mod test_utils;
@@ -288,6 +295,83 @@ impl MisbehaviorProof {
     }
 }
 
+
+// XXX this will be the only expoerted struct and it will be used by LDK
+
+pub struct LdkWtClient {
+    wt_client: Arc<Mutex<WTClient>>,
+}
+
+impl LdkWtClient {
+    pub fn new(wt_client: WTClient) -> Self {
+        Self {
+            wt_client: Arc::new(Mutex::new(wt_client)),
+        }
+    }
+
+    pub async fn on_commitment_revocation(
+        &self,
+        commitment_revocation: CommitmentRevocation,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        on_commitment_revocation(self.wt_client.clone(), commitment_revocation).await
+    }
+}
+
+impl Persist<InMemorySigner> for LdkWtClient {
+    fn persist_new_channel(
+        &self,
+        channel_funding_outpoint: OutPoint,
+        monitor: &ChannelMonitor<InMemorySigner>,
+    ) -> ChannelMonitorUpdateStatus {
+        let channel_id = monitor.channel_id().to_string();
+        let commitment_txid = monitor.get_funding_txo().0.txid;
+        let commit_num = 0;
+
+        let commitment_transaction = monitor.initial_counterparty_commitment_tx().unwrap();
+        let penalty_tx = todo!();
+
+        let commitment_revocation = CommitmentRevocation {
+            channel_id,
+            commitment_txid,
+            commit_num,
+            penalty_tx,
+        };
+
+        // TDOO: nothing just prep to call watchtower etc
+        return ChannelMonitorUpdateStatus::Completed;
+    }
+
+    fn update_persisted_channel(
+        &self,
+        channel_funding_outpoint: OutPoint,
+        monitor_update: Option<&ChannelMonitorUpdate>,
+        monitor: &ChannelMonitor<InMemorySigner>,
+    ) -> ChannelMonitorUpdateStatus {
+        let channel_id = monitor.channel_id().to_string();
+        let commitment_txid = monitor.get_funding_txo().0.txid;
+        let commit_num = monitor_update.unwrap().update_id.try_into().unwrap();
+        let commitment_transaction = monitor. counterparty_commitment_txs_from_update(monitor_update.unwrap());
+
+        let penalty_tx = todo!();
+
+        let commitment_revocation = CommitmentRevocation {
+            channel_id,
+            commitment_txid,
+            commit_num,
+            penalty_tx,
+        };
+
+        self.on_commitment_revocation(commitment_revocation);
+
+        // TDOO: check status and map it
+        return ChannelMonitorUpdateStatus::Completed;
+    }
+
+    fn archive_persisted_channel(&self, channel_funding_outpoint: OutPoint) {
+        // do nothing?
+    }
+}
+
 /// Sends an appointment to all registered towers for every new commitment transaction.
 ///
 /// The appointment is built using the data provided by the backend (dispute txid and penalty transaction).
@@ -424,6 +508,8 @@ fn send_to_retrier(state: &MutexGuard<WTClient>, tower_id: TowerId, locator: Loc
         log::debug!("Not sending data to idle retrier ({tower_id}, {locator})")
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
